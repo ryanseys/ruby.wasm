@@ -308,7 +308,12 @@ export class RubyVM {
       procToJsFunction: () => {
         const rbValue = new RbValue(component.exportRbValueToJs(), vm, vm.privateObject());
         return new JsAbiValue((...args) => {
-          return rbValue.call("call", ...args.map((arg) => vm.wrap(arg))).toJS();
+          const wrappedArgs = args.map((arg) => vm.wrap(arg));
+          const result = rbValue.call("call", ...wrappedArgs);
+          const jsResult = result.toJS();
+          wrappedArgs.forEach((wrapped) => wrapped.release());
+          result.release();
+          return jsResult;
         });
       },
       rbObjectToJsRbValue: () => {
@@ -482,7 +487,12 @@ export class RubyVM {
       procToJsFunction: (rawRbAbiValue) => {
         const rbValue = this.rbValueOfPointer(rawRbAbiValue);
         return toJSAbiValue((...args) => {
-          return rbValue.call("call", ...args.map((arg) => this.wrap(arg))).toJS();
+          const wrappedArgs = args.map((arg) => this.wrap(arg));
+          const result = rbValue.call("call", ...wrappedArgs);
+          const jsResult = result.toJS();
+          wrappedArgs.forEach((wrapped) => wrapped.release());
+          result.release();
+          return jsResult;
         });
       },
       rbObjectToJsRbValue: (rawRbAbiValue) => {
@@ -687,13 +697,17 @@ class JsValueTransport {
   }
 
   exportJsValue(value: RbValue): JsAbiValue {
-    value.call("__export_to_js");
+    const ret = value.call("__export_to_js");
+    ret.release();
     return this._takenJsValue;
   }
 
   importJsValue(value: JsAbiValue, vm: RubyVM): RbValue {
     this._takenJsValue = value;
-    return vm.eval('require "js"; JS::Object').call("__import_from_js");
+    const jsObjectClass = vm.eval('require "js"; JS::Object');
+    const ret = jsObjectClass.call("__import_from_js");
+    jsObjectClass.release();
+    return ret;
   }
 }
 
@@ -710,6 +724,28 @@ export class RbValue {
     private vm: RubyVM,
     private privateObject: RubyVMPrivate,
   ) {}
+
+  /**
+   * Explicitly release the Ruby value this wrapper holds, instead of
+   * waiting for this JS object to become unreachable and the
+   * FinalizationRegistry callback to eventually run.
+   *
+   * `RbAbiValue` is refcounted (see `clone`/`drop` in the generated
+   * bindgen glue), so this only actually releases the value once every
+   * outstanding `RbValue`/`RbAbiValue` referencing it has done the same -
+   * it's safe to call even when another wrapper still needs the value.
+   *
+   * Prefer this at the end of a short-lived RbValue's life (an
+   * intermediate call result you've already extracted a JS value from) in
+   * a hot path - the trampoline `Proc#to_js` returns is exactly such a
+   * path: without an explicit release, every invocation's temporaries pile
+   * up until the JS engine's GC happens to reclaim their wrappers, which a
+   * high-frequency caller (a rAF loop, a recurring timer, a busy event
+   * listener) can outpace by a wide margin.
+   */
+  release(): void {
+    (this.inner as any).drop?.();
+  }
 
   /**
    * Call a given method with given arguments
@@ -788,7 +824,9 @@ export class RbValue {
       "to_s",
       [],
     );
-    return this.vm.guest.rstringPtr(rbString);
+    const str = this.vm.guest.rstringPtr(rbString);
+    (rbString as any).drop?.();
+    return str;
   }
 
   /**
@@ -800,10 +838,17 @@ export class RbValue {
   toJS(): any {
     const JS = this.vm.eval("JS");
     const jsValue = JS.call("try_convert", this);
-    if (jsValue.call("nil?").toString() === "true") {
+    JS.release();
+    const nilCheck = jsValue.call("nil?");
+    const isNil = nilCheck.toString() === "true";
+    nilCheck.release();
+    if (isNil) {
+      jsValue.release();
       return null;
     }
-    return this.privateObject.transport.exportJsValue(jsValue);
+    const result = this.privateObject.transport.exportJsValue(jsValue);
+    jsValue.release();
+    return result;
   }
 }
 
