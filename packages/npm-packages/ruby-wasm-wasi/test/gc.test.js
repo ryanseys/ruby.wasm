@@ -89,6 +89,57 @@ describe("GC integration", () => {
     expect(o2.call("hash").toString()).toBe(o3.call("hash").toString());
   });
 
+  // `Proc#to_js` (procToJsFunction in src/vm.ts) returns a plain JS function
+  // that, on every call, wraps each argument AND the return value in a fresh
+  // RbValue, and (before this file's fix) never released those intermediate
+  // RbValues explicitly - they were left to whenever the JS engine happened
+  // to GC the wrapper. `RbValue#release()` (+ the toJS()/toString()/
+  // exportJsValue()/importJsValue() fixes) closes that specific gap, but
+  // does NOT close this test: the retention traces one layer deeper, into
+  // `RbValue#call()` itself (used by the trampoline to invoke the Ruby
+  // Proc). The generated bindgen glue for `rb-funcallv-protect`
+  // (src/bindgen/legacy/rb-abi-guest.js) inserts a *clone* of the receiver
+  // into a fresh resource slab slot on every single call
+  // (`this._resource0_slab.insert(obj0.clone())`), and nothing observed so
+  // far drops that slot afterward - so every `.call(...)`, regardless of
+  // arguments or return value, appears to retain roughly one slot on its
+  // own. Explicitly releasing the wrapped arguments and the call's return
+  // value (this file's fix) does not touch that receiver-clone slot at all,
+  // since it isn't exposed to the caller of `.call()` - fixing it likely
+  // needs either a leaner receiver-passing convention in the WIT interface
+  // or an explicit drop of that clone once the underlying wasm call
+  // returns. Any JS callback repeatedly invoking a Ruby proc (a DOM event
+  // listener firing often, a requestAnimationFrame loop, a timer tick)
+  // accumulates retained Ruby heap slots faster than V8's GC reclaims the
+  // short-lived wrapper objects, so live slots grow roughly linearly with
+  // invocation count and do NOT return to baseline after an explicit
+  // Ruby-side GC.start.
+  test("a JS-called Ruby proc should not permanently retain heap slots per invocation", async () => {
+    const vm = await initRubyVM();
+    const jsFn = vm.eval(`
+      require "js"
+      proc { |x| x }.to_js
+    `).toJS();
+
+    vm.eval("GC.start");
+    const before = Number(vm.eval("GC.stat(:heap_live_slots)").toString());
+
+    const ITERATIONS = 20000;
+    for (let i = 0; i < ITERATIONS; i++) {
+      jsFn(i);
+    }
+
+    vm.eval("GC.start");
+    const afterGC = Number(vm.eval("GC.stat(:heap_live_slots)").toString());
+
+    // A healthy proc->JS trampoline should not retain a meaningful fraction
+    // of one live slot per call once GC has run - this asserts growth stays
+    // under 10% of the call count as a generous bound. Today this fails: an
+    // unpatched trampoline retains roughly 2 slots per call (~40000 for
+    // 20000 iterations, i.e. ~100% growth relative to ITERATIONS).
+    expect(afterGC - before).toBeLessThan(ITERATIONS * 0.1);
+  });
+
   test("stop GC while having a sandwitched JS frame", async () => {
     const vm = await initRubyVM();
     const o = vm.eval(`
