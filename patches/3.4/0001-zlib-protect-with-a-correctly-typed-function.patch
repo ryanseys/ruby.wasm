@@ -1,0 +1,37 @@
+zlib: call rb_protect with a correctly typed function
+
+zstream_expand_buffer_protect passed zstream_expand_buffer, which returns
+void, to rb_protect through a cast to VALUE (*)(VALUE). WebAssembly checks
+the type of every indirect call, so the call traps with "function signature
+mismatch" on wasm32-wasi. It runs only when Zlib::Inflate#inflate or
+Zlib::Deflate#deflate is given a block and the output outgrows its first
+1 KB buffer. A small wrapper with the exact type rb_protect expects fixes it.
+
+--- a/ext/zlib/zlib.c
++++ b/ext/zlib/zlib.c
+@@ -716,6 +716,16 @@
+ 	z->stream.next_out = (Bytef*)RSTRING_END(z->buf);
+ 	z->stream.avail_out = MAX_UINT(size);
+     }
++}
++
++/* rb_protect calls its function through a pointer of type VALUE (*)(VALUE).
++ * zstream_expand_buffer returns void, and WebAssembly checks the type of an
++ * indirect call, so calling it through a cast traps there. */
++static VALUE
++zstream_expand_buffer_body(VALUE arg)
++{
++    zstream_expand_buffer((struct zstream *)arg);
++    return Qnil;
+ }
+ 
+ static int
+@@ -723,7 +733,7 @@
+ {
+     int state = 0;
+ 
+-    rb_protect((VALUE (*)(VALUE))zstream_expand_buffer, (VALUE)z, &state);
++    rb_protect(zstream_expand_buffer_body, (VALUE)z, &state);
+ 
+     return state;
+ }
